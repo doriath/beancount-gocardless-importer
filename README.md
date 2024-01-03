@@ -45,3 +45,17 @@ Status: Work in progress
    ```shell
    beancount-gocardless-importer list-transactions <account-id>
    ```
+
+6. Configure importer in the beancount file, by adding following metadata to the account open directive:
+
+   ```beancount
+   2020-01-01 open Assets:UK:Revolut:EUR
+     importer: "gocardless"
+     account_id: "<account-id>"
+   ```
+
+7. Run importer on your beancount file. Note: The new transactions will be added to the end of the file that contains the account open directive.
+
+   ```shell
+   beancount-gocardless-importer import ledger.beancount
+   ```

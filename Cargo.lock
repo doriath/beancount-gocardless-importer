@@ -151,6 +151,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "beanru",
+ "chrono",
  "clap",
  "gocardless",
  "rust_decimal",
@@ -575,6 +576,7 @@ checksum = "4271d37baee1b8c7e4b708028c57d816cf9d2434acb33a549475f78c181f6253"
 [[package]]
 name = "gocardless"
 version = "0.0.1"
+source = "git+https://github.com/doriath/gocardless#60738cb664326aec96e37d413f22e3872e38adf1"
 dependencies = [
  "reqwest",
  "serde",

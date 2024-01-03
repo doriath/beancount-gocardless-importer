@@ -1,9 +1,18 @@
 use anyhow::Context;
+use beanru::types::{
+    Account, Amount, Currency, Directive, DirectiveContent, Ledger, MetadataValue, Posting,
+    Transaction,
+};
 use clap::{Parser, Subcommand};
-use gocardless::models::{JwtRefreshRequest, SpectacularJwtObtain, Status1c5Enum};
+use gocardless::models::{
+    JwtRefreshRequest, SpectacularJwtObtain, Status1c5Enum, TransactionSchema,
+};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     os::unix::fs::PermissionsExt,
+    path::PathBuf,
     time::{Duration, SystemTime},
 };
 use tokio::io::AsyncWriteExt;
@@ -33,7 +42,16 @@ enum Commands {
         requisition_id: String,
     },
     ListTransactions {
+        /// The ID of the account to list transactions for.
+        /// The IDs can be seen through `list-requisitions` command.
         account_id: String,
+    },
+    Import {
+        /// Import transactions based on configuration in given beancount ledger.
+        ///
+        /// The ledger is expected to have special metadata on the account that configures the
+        /// importer. For more information, see README.md
+        beancount_path: PathBuf,
     },
 }
 
@@ -83,7 +101,7 @@ async fn get_token() -> anyhow::Result<String> {
         JwtRefreshRequest::new(tokens.refresh_token),
     )
     .await?;
-    // TODO: update the file
+    // TODO: update the file with the new token to avoid always refreshing it.
     Ok(jwt.access.unwrap())
 }
 
@@ -95,6 +113,116 @@ async fn config_with_token() -> anyhow::Result<gocardless::apis::configuration::
         bearer_access_token: Some(token),
         ..Default::default()
     })
+}
+
+fn narration(t: &TransactionSchema) -> Option<String> {
+    if let Some(inf) = &t.remittance_information_unstructured_array {
+        if !inf.is_empty() {
+            return Some(inf.join(", "));
+        }
+    }
+    if let Some(inf) = &t.remittance_information_unstructured {
+        return Some(inf.clone());
+    }
+    t.creditor_name.clone()
+}
+
+fn gocardless_transaction_to_beancount(
+    t: &TransactionSchema,
+    account: &Account,
+) -> anyhow::Result<Directive<Decimal>> {
+    let (date, _) = chrono::NaiveDate::parse_and_remainder(
+        t.booking_date.as_ref().context("booking date is missing")?,
+        "%Y-%m-%d",
+    )?;
+    let mut metadata: HashMap<String, MetadataValue<Decimal>> = HashMap::new();
+    if let Some(dt) = &t.booking_date_time {
+        metadata.insert(
+            "booking_date_time".into(),
+            MetadataValue::String(dt.clone()),
+        );
+    }
+    if let Some(dt) = &t.value_date_time {
+        metadata.insert("value_date_time".into(), MetadataValue::String(dt.clone()));
+    }
+    if let Some(debtor_name) = &t.debtor_name {
+        metadata.insert(
+            "from_name".into(),
+            MetadataValue::String(debtor_name.clone()),
+        );
+    }
+    if let Some(d) = &t.debtor_account {
+        if let Some(iban) = &d.iban {
+            metadata.insert("from_iban".into(), MetadataValue::String(iban.clone()));
+        }
+    }
+    if let Some(creditor_name) = &t.creditor_name {
+        metadata.insert(
+            "to_name".into(),
+            MetadataValue::String(creditor_name.clone()),
+        );
+    }
+    if let Some(d) = &t.creditor_account {
+        if let Some(iban) = &d.iban {
+            metadata.insert("to_iban".into(), MetadataValue::String(iban.clone()));
+        }
+    }
+    if let Some(ce) = &t.currency_exchange {
+        if let Some(sc) = &ce.source_currency {
+            metadata.insert("source_currency".into(), MetadataValue::String(sc.clone()));
+        }
+        if let Some(sc) = &ce.exchange_rate {
+            metadata.insert("exchange_rate".into(), MetadataValue::String(sc.clone()));
+        }
+        if let Some(sc) = &ce.target_currency {
+            metadata.insert("target_currency".into(), MetadataValue::String(sc.clone()));
+        }
+    }
+    if let Some(tc) = &t.proprietary_bank_transaction_code {
+        metadata.insert("transaction_code".into(), MetadataValue::String(tc.clone()));
+    }
+
+    let mut links = HashSet::new();
+    if let Some(id) = &t.internal_transaction_id {
+        links.insert(format!("id-{}", id));
+    }
+
+    let transaction = Transaction {
+        flag: None,
+        payee: None,
+        narration: narration(t),
+        tags: Default::default(),
+        links,
+        postings: vec![Posting {
+            flag: None,
+            account: account.clone(),
+            amount: Some(Amount {
+                value: t.transaction_amount.amount.parse()?,
+                currency: Currency(t.transaction_amount.currency.clone()),
+            }),
+            cost: None,
+            price: None,
+            metadata: Default::default(),
+            autocomputed: false,
+        }],
+        balanced: false,
+    };
+    let d = Directive {
+        date,
+        content: DirectiveContent::Transaction(transaction),
+        metadata,
+    };
+    Ok(d)
+}
+
+fn is_duplicate(d: &Directive<Decimal>, ids: &HashSet<String>) -> bool {
+    let Some(t) = d.content.transaction_opt() else { return false; };
+    for link in &t.links {
+        if ids.contains(link) {
+            return true;
+        }
+    }
+    false
 }
 
 #[tokio::main]
@@ -190,6 +318,69 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("{}", serde_yaml::to_string(&res)?);
+        }
+        Commands::Import { beancount_path } => {
+            let config = config_with_token().await?;
+
+            let mut ledger: Ledger<Decimal> = Ledger::read(beancount_path, |p| async {
+                Ok(tokio::fs::read_to_string(p).await?)
+            })
+            .await?;
+
+            let mut ids: HashSet<String> = HashSet::new();
+            for (_, file) in &mut ledger.files {
+                for d in &file.directives {
+                    if let DirectiveContent::Transaction(t) = &d.content {
+                        for link in &t.links {
+                            if link.starts_with("id-") {
+                                ids.insert(link.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (_, file) in &mut ledger.files {
+                let mut to_import: Vec<(String, Account)> = vec![];
+                for d in &file.directives {
+                    if let DirectiveContent::Open(ref open) = d.content {
+                        let Some(importer)  = d.metadata.get("importer") else { continue };
+                        let MetadataValue::String(importer) = importer else { continue };
+                        if importer != "gocardless" {
+                            continue;
+                        }
+
+                        let Some(account_id)  = d.metadata.get("account_id") else { continue };
+                        let MetadataValue::String(account_id) = account_id else { continue };
+                        to_import.push((account_id.clone(), open.account.clone()));
+                    }
+                }
+                for (account_id, account) in to_import {
+                    println!("Retrieving transactions for {} ...", account);
+                    let res = gocardless::apis::accounts_api::retrieve_account_transactions(
+                        &config,
+                        &account_id,
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                    let mut new_directives = Vec::new();
+                    for t in res.transactions.booked {
+                        let d = gocardless_transaction_to_beancount(&t, &account)?;
+                        if !is_duplicate(&d, &ids) {
+                            new_directives.push(d);
+                        }
+                    }
+                    new_directives.reverse();
+                    new_directives.sort_by_key(|d| d.date);
+                    file.directives.append(&mut new_directives);
+                }
+            }
+
+            ledger
+                .write(|p, content| async { Ok(tokio::fs::write(p, content).await?) })
+                .await?;
         }
     }
     Ok(())
