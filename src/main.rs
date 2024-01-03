@@ -1,8 +1,9 @@
 use anyhow::Context;
-use beanru::types::{
+use beanru::{types::{
     Account, Amount, Currency, Directive, DirectiveContent, Ledger, MetadataValue, Posting,
-    Transaction,
-};
+    Transaction, Balance,
+}, bag::Bag};
+use chrono::{NaiveDate, Days};
 use clap::{Parser, Subcommand};
 use gocardless::models::{
     JwtRefreshRequest, SpectacularJwtObtain, Status1c5Enum, TransactionSchema,
@@ -42,6 +43,11 @@ enum Commands {
         requisition_id: String,
     },
     ListTransactions {
+        /// The ID of the account to list transactions for.
+        /// The IDs can be seen through `list-requisitions` command.
+        account_id: String,
+    },
+    Balance {
         /// The ID of the account to list transactions for.
         /// The IDs can be seen through `list-requisitions` command.
         account_id: String,
@@ -225,6 +231,150 @@ fn is_duplicate(d: &Directive<Decimal>, ids: &HashSet<String>) -> bool {
     false
 }
 
+async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
+    let config = config_with_token().await?;
+
+    let mut ids: HashSet<String> = HashSet::new();
+    let mut last_balance: HashMap<Account, (NaiveDate, Amount<Decimal>)> = HashMap::new();
+    let mut last_transaction: HashMap<Account, NaiveDate> = HashMap::new();
+
+    for (_, file) in &mut ledger.files {
+        for d in &file.directives {
+            match &d.content {
+                DirectiveContent::Transaction(t) => {
+                    for link in &t.links {
+                        if link.starts_with("id-") {
+                            ids.insert(link.clone());
+                        }
+                    }
+                    for p in &t.postings {
+                        last_transaction.entry(p.account.clone()).and_modify(|t|{
+                            if *t < d.date {
+                                *t = d.date;
+                            }
+                        }).or_insert(d.date);
+                    }
+                }
+                DirectiveContent::Balance(b) => {
+                    last_balance.entry(b.account.clone()).and_modify(|e| {
+                        if e.0 < d.date {
+                            *e = (d.date, b.amount.clone())
+                        }
+                    }).or_insert((d.date, b.amount.clone()));
+                }
+                _ => {},
+            }
+        }
+    }
+
+    for (_, file) in &mut ledger.files {
+        // (gocardless_account_id, account)
+        let mut to_import: Vec<(String, Account)> = vec![];
+        // Scan the file for the list of configured accounts with gocardless importer.
+        for d in &file.directives {
+            if let DirectiveContent::Open(ref open) = d.content {
+                let Some(importer)  = d.metadata.get("importer") else { continue };
+                let MetadataValue::String(importer) = importer else { continue };
+                if importer != "gocardless" {
+                    continue;
+                }
+
+                let Some(account_id)  = d.metadata.get("account_id") else { continue };
+                let MetadataValue::String(account_id) = account_id else { continue };
+                to_import.push((account_id.clone(), open.account.clone()));
+            }
+        }
+        // Add new transactions (and collect the pending ones, used later for balance assertions).
+        let mut pending_bag: HashMap<Account, Bag<Decimal>> = HashMap::new();
+        for (account_id, account) in &to_import {
+            println!("Retrieving transactions for {} ...", account);
+            let res = gocardless::apis::accounts_api::retrieve_account_transactions(
+                &config,
+                account_id,
+                None,
+                None,
+            )
+            .await?;
+
+            let mut new_directives = Vec::new();
+            for t in res.transactions.booked {
+                let d = gocardless_transaction_to_beancount(&t, account)?;
+                if !is_duplicate(&d, &ids) {
+                    new_directives.push(d);
+                }
+            }
+            for t in res.transactions.pending.unwrap_or_default() {
+                *pending_bag.entry(account.clone()).or_default() += Amount {
+                    value: t.transaction_amount.amount.parse()?,
+                    currency: Currency(t.transaction_amount.currency.clone()),
+                };
+            }
+
+            new_directives.reverse();
+            new_directives.sort_by_key(|d| d.date);
+
+            if let Some(d) = new_directives.last() {
+                last_transaction.entry(account.clone()).and_modify(|t|{
+                    if *t < d.date {
+                        *t = d.date;
+                    }
+                }).or_insert(d.date);
+            }
+
+            file.directives.append(&mut new_directives);
+        }
+        // Add balances to the accounts
+        for (account_id, account) in &to_import {
+            println!("Balancing {} ...", account);
+            let res = gocardless::apis::accounts_api::retrieve_account_balances(
+                &config,
+                account_id,
+            )
+            .await?;
+            let Some(b) = res.balances else { continue; };
+            let Some(b) = b.get(0) else { continue; };
+            
+            let mut amount = Amount {
+                value: Decimal::from_str_exact(&b.balance_amount.amount)?,
+                currency: Currency(b.balance_amount.currency.clone()),
+            };
+            if let Some(bag) = pending_bag.get(account) {
+                if let Some(a) = bag.commodities().get(&amount.currency) {
+                    amount.value -= a;
+                }
+            }
+            
+            let previous_balance = last_balance.get(account);
+            println!("New: {:?}, previous: {:?}", amount, previous_balance);
+            if let Some((_, previous_balance)) = previous_balance {
+                if amount == previous_balance.clone() {
+                    println!("Previous balance matches the new one, skipping balance directive");
+                    continue;
+                }
+            }
+
+            let date = b.reference_date.as_ref().map(|rd| {
+                let (date, _) = chrono::NaiveDate::parse_and_remainder(
+                   rd,
+                    "%Y-%m-%d",
+                ).unwrap();
+                date
+            }).
+            unwrap_or_else(|| {
+                (*last_transaction.get(account).unwrap()).checked_add_days(Days::new(1)).unwrap()
+            });
+
+            let d = Directive {
+                date,
+                content: DirectiveContent::Balance(Balance{ account: account.clone(), amount }),
+                metadata: Default::default(),
+            };
+            file.directives.push(d);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -319,64 +469,23 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             println!("{}", serde_yaml::to_string(&res)?);
         }
-        Commands::Import { beancount_path } => {
+        Commands::Balance { account_id } => {
             let config = config_with_token().await?;
+            let res = gocardless::apis::accounts_api::retrieve_account_balances(
+                &config,
+                &account_id,
+            )
+            .await?;
+            println!("{}", serde_yaml::to_string(&res)?);
+        }
+        Commands::Import { beancount_path } => {
 
             let mut ledger: Ledger<Decimal> = Ledger::read(beancount_path, |p| async {
                 Ok(tokio::fs::read_to_string(p).await?)
             })
             .await?;
 
-            let mut ids: HashSet<String> = HashSet::new();
-            for (_, file) in &mut ledger.files {
-                for d in &file.directives {
-                    if let DirectiveContent::Transaction(t) = &d.content {
-                        for link in &t.links {
-                            if link.starts_with("id-") {
-                                ids.insert(link.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (_, file) in &mut ledger.files {
-                let mut to_import: Vec<(String, Account)> = vec![];
-                for d in &file.directives {
-                    if let DirectiveContent::Open(ref open) = d.content {
-                        let Some(importer)  = d.metadata.get("importer") else { continue };
-                        let MetadataValue::String(importer) = importer else { continue };
-                        if importer != "gocardless" {
-                            continue;
-                        }
-
-                        let Some(account_id)  = d.metadata.get("account_id") else { continue };
-                        let MetadataValue::String(account_id) = account_id else { continue };
-                        to_import.push((account_id.clone(), open.account.clone()));
-                    }
-                }
-                for (account_id, account) in to_import {
-                    println!("Retrieving transactions for {} ...", account);
-                    let res = gocardless::apis::accounts_api::retrieve_account_transactions(
-                        &config,
-                        &account_id,
-                        None,
-                        None,
-                    )
-                    .await?;
-
-                    let mut new_directives = Vec::new();
-                    for t in res.transactions.booked {
-                        let d = gocardless_transaction_to_beancount(&t, &account)?;
-                        if !is_duplicate(&d, &ids) {
-                            new_directives.push(d);
-                        }
-                    }
-                    new_directives.reverse();
-                    new_directives.sort_by_key(|d| d.date);
-                    file.directives.append(&mut new_directives);
-                }
-            }
+            import(&mut ledger).await?;
 
             ledger
                 .write(|p, content| async { Ok(tokio::fs::write(p, content).await?) })

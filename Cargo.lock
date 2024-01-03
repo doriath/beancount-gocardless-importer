@@ -177,7 +177,7 @@ dependencies = [
 [[package]]
 name = "beanru"
 version = "0.1.0"
-source = "git+https://github.com/doriath/beanru#0ac4d7892bb9e36e8ae1765f9ee41ede7ee9659b"
+source = "git+https://github.com/doriath/beanru#7b86de1f079e51e1a83ac8102f13f7f53751c344"
 dependencies = [
  "anyhow",
  "beancount-parser",
