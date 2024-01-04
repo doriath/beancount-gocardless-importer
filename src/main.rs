@@ -386,7 +386,6 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
             }
 
             let previous_balance = last_balance.get(account);
-            println!("New: {:?}, previous: {:?}", amount, previous_balance);
             if let Some((_, previous_balance)) = previous_balance {
                 if amount == previous_balance.clone() {
                     println!("Previous balance matches the new one, skipping balance directive");
