@@ -1,12 +1,16 @@
 use anyhow::Context;
-use beanru::{types::{
-    Account, Amount, Currency, Directive, DirectiveContent, Ledger, MetadataValue, Posting,
-    Transaction, Balance,
-}, bag::Bag};
-use chrono::{NaiveDate, Days};
+use beanru::{
+    bag::Bag,
+    types::{
+        Account, Amount, Balance, Currency, Directive, DirectiveContent, Ledger, MetadataValue,
+        Posting, Transaction,
+    },
+};
+use chrono::{Days, NaiveDate};
 use clap::{Parser, Subcommand};
 use gocardless::models::{
-    JwtRefreshRequest, SpectacularJwtObtain, Status1c5Enum, TransactionSchema,
+    JwtRefreshRequest, SpectacularJwtObtain, SpectacularJwtRefresh, Status1c5Enum,
+    TransactionSchema,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -88,27 +92,46 @@ impl Tokens {
                 ),
         })
     }
+
+    fn update_access_token(
+        &mut self,
+        now: SystemTime,
+        jwt: &SpectacularJwtRefresh,
+    ) -> anyhow::Result<()> {
+        self.access_token = jwt.access.clone().context("access token is missing")?;
+        self.access_expires = now
+            + Duration::from_secs(
+                jwt.access_expires
+                    .context("access token expiration is missing")?
+                    .try_into()?,
+            );
+        Ok(())
+    }
+}
+
+fn base_config_dir() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var("HOME")?).join(".gocardless"))
 }
 
 async fn get_token() -> anyhow::Result<String> {
-    let path = std::path::PathBuf::from(std::env!("HOME"))
-        .join(".gocardless")
-        .join("token.yml");
-    let tokens: Tokens = serde_yaml::from_str(&tokio::fs::read_to_string(path).await?)?;
-    if SystemTime::now() < tokens.access_expires {
+    let path = base_config_dir()?.join("token.yml");
+    let now = SystemTime::now();
+    let mut tokens: Tokens = serde_yaml::from_str(&tokio::fs::read_to_string(&path).await?)?;
+    if now < tokens.access_expires {
         return Ok(tokens.access_token);
     }
-    if SystemTime::now() > tokens.refresh_expires {
+    if now > tokens.refresh_expires {
         anyhow::bail!("refresh token exipred")
     }
     let config = gocardless::apis::configuration::Configuration::default();
     let jwt = gocardless::apis::token_api::get_a_new_access_token(
         &config,
-        JwtRefreshRequest::new(tokens.refresh_token),
+        JwtRefreshRequest::new(tokens.refresh_token.clone()),
     )
     .await?;
-    // TODO: update the file with the new token to avoid always refreshing it.
-    Ok(jwt.access.unwrap())
+    tokens.update_access_token(now, &jwt)?;
+    tokio::fs::write(&path, serde_yaml::to_string(&tokens)?.as_bytes()).await?;
+    Ok(tokens.access_token)
 }
 
 async fn config_with_token() -> anyhow::Result<gocardless::apis::configuration::Configuration> {
@@ -248,21 +271,27 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
                         }
                     }
                     for p in &t.postings {
-                        last_transaction.entry(p.account.clone()).and_modify(|t|{
-                            if *t < d.date {
-                                *t = d.date;
-                            }
-                        }).or_insert(d.date);
+                        last_transaction
+                            .entry(p.account.clone())
+                            .and_modify(|t| {
+                                if *t < d.date {
+                                    *t = d.date;
+                                }
+                            })
+                            .or_insert(d.date);
                     }
                 }
                 DirectiveContent::Balance(b) => {
-                    last_balance.entry(b.account.clone()).and_modify(|e| {
-                        if e.0 < d.date {
-                            *e = (d.date, b.amount.clone())
-                        }
-                    }).or_insert((d.date, b.amount.clone()));
+                    last_balance
+                        .entry(b.account.clone())
+                        .and_modify(|e| {
+                            if e.0 < d.date {
+                                *e = (d.date, b.amount.clone())
+                            }
+                        })
+                        .or_insert((d.date, b.amount.clone()));
                 }
-                _ => {},
+                _ => {}
             }
         }
     }
@@ -289,10 +318,7 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
         for (account_id, account) in &to_import {
             println!("Retrieving transactions for {} ...", account);
             let res = gocardless::apis::accounts_api::retrieve_account_transactions(
-                &config,
-                account_id,
-                None,
-                None,
+                &config, account_id, None, None,
             )
             .await?;
 
@@ -314,11 +340,14 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
             new_directives.sort_by_key(|d| d.date);
 
             if let Some(d) = new_directives.last() {
-                last_transaction.entry(account.clone()).and_modify(|t|{
-                    if *t < d.date {
-                        *t = d.date;
-                    }
-                }).or_insert(d.date);
+                last_transaction
+                    .entry(account.clone())
+                    .and_modify(|t| {
+                        if *t < d.date {
+                            *t = d.date;
+                        }
+                    })
+                    .or_insert(d.date);
             }
 
             file.directives.append(&mut new_directives);
@@ -326,14 +355,12 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
         // Add balances to the accounts
         for (account_id, account) in &to_import {
             println!("Balancing {} ...", account);
-            let res = gocardless::apis::accounts_api::retrieve_account_balances(
-                &config,
-                account_id,
-            )
-            .await?;
+            let res =
+                gocardless::apis::accounts_api::retrieve_account_balances(&config, account_id)
+                    .await?;
             let Some(b) = res.balances else { continue; };
             let Some(b) = b.get(0) else { continue; };
-            
+
             let mut amount = Amount {
                 value: Decimal::from_str_exact(&b.balance_amount.amount)?,
                 currency: Currency(b.balance_amount.currency.clone()),
@@ -343,7 +370,7 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
                     amount.value -= a;
                 }
             }
-            
+
             let previous_balance = last_balance.get(account);
             println!("New: {:?}, previous: {:?}", amount, previous_balance);
             if let Some((_, previous_balance)) = previous_balance {
@@ -353,20 +380,25 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
                 }
             }
 
-            let date = b.reference_date.as_ref().map(|rd| {
-                let (date, _) = chrono::NaiveDate::parse_and_remainder(
-                   rd,
-                    "%Y-%m-%d",
-                ).unwrap();
-                date
-            }).
-            unwrap_or_else(|| {
-                (*last_transaction.get(account).unwrap()).checked_add_days(Days::new(1)).unwrap()
-            });
+            let date = b
+                .reference_date
+                .as_ref()
+                .map(|rd| {
+                    let (date, _) = chrono::NaiveDate::parse_and_remainder(rd, "%Y-%m-%d").unwrap();
+                    date
+                })
+                .unwrap_or_else(|| {
+                    (*last_transaction.get(account).unwrap())
+                        .checked_add_days(Days::new(1))
+                        .unwrap()
+                });
 
             let d = Directive {
                 date,
-                content: DirectiveContent::Balance(Balance{ account: account.clone(), amount }),
+                content: DirectiveContent::Balance(Balance {
+                    account: account.clone(),
+                    amount,
+                }),
                 metadata: Default::default(),
             };
             file.directives.push(d);
@@ -395,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
 
             let tokens = Tokens::from_jwt(SystemTime::now(), &jwt)?;
 
-            let token_yaml_dir = std::path::PathBuf::from(std::env!("HOME")).join(".gocardless");
+            let token_yaml_dir = base_config_dir()?;
             tokio::fs::create_dir_all(&token_yaml_dir).await?;
             let dir_permissions = std::fs::Permissions::from_mode(0o700);
             tokio::fs::set_permissions(&token_yaml_dir, dir_permissions).await?;
@@ -471,15 +503,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Balance { account_id } => {
             let config = config_with_token().await?;
-            let res = gocardless::apis::accounts_api::retrieve_account_balances(
-                &config,
-                &account_id,
-            )
-            .await?;
+            let res =
+                gocardless::apis::accounts_api::retrieve_account_balances(&config, &account_id)
+                    .await?;
             println!("{}", serde_yaml::to_string(&res)?);
         }
         Commands::Import { beancount_path } => {
-
             let mut ledger: Ledger<Decimal> = Ledger::read(beancount_path, |p| async {
                 Ok(tokio::fs::read_to_string(p).await?)
             })
