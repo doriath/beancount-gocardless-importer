@@ -245,7 +245,9 @@ fn gocardless_transaction_to_beancount(
 }
 
 fn is_duplicate(d: &Directive<Decimal>, ids: &HashSet<String>) -> bool {
-    let Some(t) = d.content.transaction_opt() else { return false; };
+    let Some(t) = d.content.transaction_opt() else {
+        return false;
+    };
     for link in &t.links {
         if ids.contains(link) {
             return true;
@@ -302,14 +304,22 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
         // Scan the file for the list of configured accounts with gocardless importer.
         for d in &file.directives {
             if let DirectiveContent::Open(ref open) = d.content {
-                let Some(importer)  = d.metadata.get("importer") else { continue };
-                let MetadataValue::String(importer) = importer else { continue };
+                let Some(importer) = d.metadata.get("importer") else {
+                    continue;
+                };
+                let MetadataValue::String(importer) = importer else {
+                    continue;
+                };
                 if importer != "gocardless" {
                     continue;
                 }
 
-                let Some(account_id)  = d.metadata.get("account_id") else { continue };
-                let MetadataValue::String(account_id) = account_id else { continue };
+                let Some(account_id) = d.metadata.get("account_id") else {
+                    continue;
+                };
+                let MetadataValue::String(account_id) = account_id else {
+                    continue;
+                };
                 to_import.push((account_id.clone(), open.account.clone()));
             }
         }
@@ -358,8 +368,12 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
             let res =
                 gocardless::apis::accounts_api::retrieve_account_balances(&config, account_id)
                     .await?;
-            let Some(b) = res.balances else { continue; };
-            let Some(b) = b.get(0) else { continue; };
+            let Some(b) = res.balances else {
+                continue;
+            };
+            let Some(b) = b.first() else {
+                continue;
+            };
 
             let mut amount = Amount {
                 value: Decimal::from_str_exact(&b.balance_amount.amount)?,
@@ -465,7 +479,9 @@ async fn main() -> anyhow::Result<()> {
             let res =
                 gocardless::apis::requisitions_api::retrieve_all_requisitions(&config, None, None)
                     .await?;
-            let Some(requisitions) = res.results else { return Ok(()) };
+            let Some(requisitions) = res.results else {
+                return Ok(());
+            };
             for r in requisitions {
                 println!("ID: {:?}", r.id);
                 println!("Institution ID: {}", r.institution_id);
