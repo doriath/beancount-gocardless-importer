@@ -62,6 +62,8 @@ enum Commands {
         /// The ledger is expected to have special metadata on the account that configures the
         /// importer. For more information, see README.md
         beancount_path: PathBuf,
+        #[arg(long)]
+        filter_account_re: Option<regex::Regex>,
     },
 }
 
@@ -128,7 +130,8 @@ async fn get_token() -> anyhow::Result<String> {
         &config,
         JwtRefreshRequest::new(tokens.refresh_token.clone()),
     )
-    .await?;
+    .await
+    .map_err(gocardless_err)?;
     tokens.update_access_token(now, &jwt)?;
     tokio::fs::write(&path, serde_yaml::to_string(&tokens)?.as_bytes()).await?;
     Ok(tokens.access_token)
@@ -256,7 +259,10 @@ fn is_duplicate(d: &Directive<Decimal>, ids: &HashSet<String>) -> bool {
     false
 }
 
-async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
+async fn import(
+    ledger: &mut Ledger<Decimal>,
+    filter_account_re: Option<regex::Regex>,
+) -> anyhow::Result<()> {
     let config = config_with_token().await?;
 
     let mut ids: HashSet<String> = HashSet::new();
@@ -320,6 +326,11 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
                 let MetadataValue::String(account_id) = account_id else {
                     continue;
                 };
+                if let Some(ref filter) = filter_account_re {
+                    if !filter.is_match(&open.account.0) {
+                        continue;
+                    }
+                }
                 to_import.push((account_id.clone(), open.account.clone()));
             }
         }
@@ -330,7 +341,8 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
             let res = gocardless::apis::accounts_api::retrieve_account_transactions(
                 &config, account_id, None, None,
             )
-            .await?;
+            .await
+            .map_err(gocardless_err)?;
 
             let mut new_directives = Vec::new();
             for t in res.transactions.booked {
@@ -367,7 +379,8 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
             println!("Balancing {} ...", account);
             let res =
                 gocardless::apis::accounts_api::retrieve_account_balances(&config, account_id)
-                    .await?;
+                    .await
+                    .map_err(gocardless_err)?;
             let Some(b) = res.balances else {
                 continue;
             };
@@ -420,6 +433,14 @@ async fn import(ledger: &mut Ledger<Decimal>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gocardless_err<T>(e: gocardless::apis::Error<T>) -> anyhow::Error {
+    if let gocardless::apis::Error::ResponseError(ref c) = e {
+        anyhow::format_err!("error in response, {}", c.content)
+    } else {
+        anyhow::format_err!("{}", e)
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -436,7 +457,8 @@ async fn main() -> anyhow::Result<()> {
             let jwt = gocardless::apis::token_api::obtain_new_access_slash_refresh_token_pair(
                 &config, secrets,
             )
-            .await?;
+            .await
+            .map_err(gocardless_err)?;
 
             let tokens = Tokens::from_jwt(SystemTime::now(), &jwt)?;
 
@@ -455,7 +477,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ListInstitutions { country } => {
             let config = config_with_token().await?;
-            let banks = gocardless::apis::institutions_api::retrieve_all_supported_institutions_in_a_given_country(&config, None, None, None, None, None, country.as_deref(), None, None, None, None, None, None, None).await?;
+            let banks = gocardless::apis::institutions_api::retrieve_all_supported_institutions_in_a_given_country(&config, None, None, None, None, None, country.as_deref(), None, None, None, None, None, None, None).await.map_err(gocardless_err)?;
             println!("ID: NAME");
             for bank in banks {
                 println!("{}: {}", bank.id, bank.name);
@@ -467,7 +489,9 @@ async fn main() -> anyhow::Result<()> {
                 Some("https://example.com/".into()),
                 institution_id,
             );
-            let res = gocardless::apis::requisitions_api::create_requisition(&config, req).await?;
+            let res = gocardless::apis::requisitions_api::create_requisition(&config, req)
+                .await
+                .map_err(gocardless_err)?;
             let link = res
                 .link
                 .context("setup link is missing from the gocardless response")?;
@@ -477,7 +501,8 @@ async fn main() -> anyhow::Result<()> {
             let config = config_with_token().await?;
             let res =
                 gocardless::apis::requisitions_api::retrieve_all_requisitions(&config, None, None)
-                    .await?;
+                    .await
+                    .map_err(gocardless_err)?;
             let Some(requisitions) = res.results else {
                 return Ok(());
             };
@@ -503,7 +528,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::DeleteRequisition { requisition_id } => {
             let config = config_with_token().await?;
             gocardless::apis::requisitions_api::delete_requisition_by_id(&config, &requisition_id)
-                .await?;
+                .await
+                .map_err(gocardless_err)?;
         }
         Commands::ListTransactions { account_id } => {
             let config = config_with_token().await?;
@@ -513,23 +539,28 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 None,
             )
-            .await?;
+            .await
+            .map_err(gocardless_err)?;
             println!("{}", serde_yaml::to_string(&res)?);
         }
         Commands::Balance { account_id } => {
             let config = config_with_token().await?;
             let res =
                 gocardless::apis::accounts_api::retrieve_account_balances(&config, &account_id)
-                    .await?;
+                    .await
+                    .map_err(gocardless_err)?;
             println!("{}", serde_yaml::to_string(&res)?);
         }
-        Commands::Import { beancount_path } => {
+        Commands::Import {
+            beancount_path,
+            filter_account_re,
+        } => {
             let mut ledger: Ledger<Decimal> = Ledger::read(beancount_path, |p| async {
                 Ok(tokio::fs::read_to_string(p).await?)
             })
             .await?;
 
-            import(&mut ledger).await?;
+            import(&mut ledger, filter_account_re).await?;
 
             ledger
                 .write(|p, content| async { Ok(tokio::fs::write(p, content).await?) })
